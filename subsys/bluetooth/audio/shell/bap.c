@@ -2203,6 +2203,8 @@ static int cmd_context(const struct shell *sh, size_t argc, char *argv[])
 	enum bt_audio_context ctx;
 	unsigned long ctx_val;
 
+    shell_error(sh, "cmd context");
+
 	if (!strcmp(argv[1], "sink")) {
 		dir = BT_AUDIO_DIR_SINK;
 	} else if (!strcmp(argv[1], "source")) {
