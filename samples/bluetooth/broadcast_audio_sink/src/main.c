@@ -25,10 +25,10 @@ BUILD_ASSERT(IS_ENABLED(CONFIG_SCAN_SELF) || IS_ENABLED(CONFIG_SCAN_OFFLOAD),
 #define ADV_TIMEOUT K_FOREVER
 #endif /* CONFIG_SCAN_SELF */
 
-#define INVALID_BROADCAST_ID      (BT_AUDIO_BROADCAST_ID_MAX + 1)
-#define SYNC_RETRY_COUNT          6 /* similar to retries for connections */
-#define PA_SYNC_SKIP              5
-#define NAME_LEN                  sizeof(CONFIG_TARGET_BROADCAST_NAME) + 1
+#define INVALID_BROADCAST_ID (BT_AUDIO_BROADCAST_ID_MAX + 1)
+#define SYNC_RETRY_COUNT     6 /* similar to retries for connections */
+#define PA_SYNC_SKIP         5
+#define NAME_LEN             sizeof(CONFIG_TARGET_BROADCAST_NAME) + 1
 
 static K_SEM_DEFINE(sem_connected, 0U, 1U);
 static K_SEM_DEFINE(sem_disconnected, 0U, 1U);
@@ -56,11 +56,13 @@ static struct broadcast_sink_stream {
 	size_t loss_cnt;
 	size_t error_cnt;
 	size_t valid_cnt;
+	uint16_t in_buf_len;
+	struct net_buf *in_buf;
+	struct k_work_delayable lc3_decode_work;
 } streams[CONFIG_BT_BAP_BROADCAST_SNK_STREAM_COUNT];
 static struct bt_bap_stream *streams_p[ARRAY_SIZE(streams)];
 static struct bt_conn *broadcast_assistant_conn;
 static struct bt_le_ext_adv *ext_adv;
-
 
 static const struct bt_audio_codec_cap codec_cap = BT_AUDIO_CODEC_CAP_LC3(
 	BT_AUDIO_CODEC_LC3_FREQ_16KHZ | BT_AUDIO_CODEC_LC3_FREQ_24KHZ,
@@ -76,6 +78,91 @@ static uint32_t requested_bis_sync;
 static uint32_t bis_index_bitfield;
 static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 
+#if defined(CONFIG_LIBLC3)
+
+#include "lc3.h"
+
+#define MAX_SAMPLE_RATE       16000
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES       ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+
+static int16_t audio_buf[MAX_NUM_SAMPLES];
+static lc3_decoder_t lc3_decoder;
+static lc3_decoder_mem_16k_t lc3_decoder_mem;
+static int frames_per_sdu;
+
+static int lc3_enable(struct bt_audio_codec_cfg *codec_cfg)
+{
+	int ret;
+	int freq_hz;
+	int frame_duration_us;
+
+	printk("Enable: stream with codec %p\n", codec_cfg);
+
+	ret = bt_audio_codec_cfg_get_freq(codec_cfg);
+	if (ret > 0) {
+		freq_hz = bt_audio_codec_cfg_freq_to_freq_hz(ret);
+	} else {
+		printk("Error: Codec frequency not set, cannot start codec.");
+		return -1;
+	}
+
+	ret = bt_audio_codec_cfg_get_frame_dur(codec_cfg);
+	if (ret > 0) {
+		frame_duration_us = bt_audio_codec_cfg_frame_dur_to_frame_dur_us(ret);
+	} else {
+		printk("Error: Frame duration not set, cannot start codec.");
+		return ret;
+	}
+
+	frames_per_sdu = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
+
+	lc3_decoder = lc3_setup_decoder(frame_duration_us, freq_hz, 0, /* No resampling */
+					&lc3_decoder_mem);
+
+	if (lc3_decoder == NULL) {
+		printk("ERROR: Failed to setup LC3 decoder - wrong parameters?\n");
+		return -1;
+	}
+	return 0;
+}
+
+static void lc3_decode_handler(struct k_work *work)
+{
+	int err = 0;
+
+	struct broadcast_sink_stream *sink_stream = CONTAINER_OF(
+		k_work_delayable_from_work(work), struct broadcast_sink_stream, lc3_decode_work);
+	const uint8_t *in_buf = sink_stream->in_buf;
+	const int octets_per_frame = sink_stream->in_buf_len / frames_per_sdu;
+	/* This code is to demonstrate the use of the LC3 codec. On an actual implementation
+	 * it might be required to offload the processing to another task to avoid blocking the
+	 * BT stack.
+	 */
+	for (size_t i = 0; i < frames_per_sdu; i++) {
+
+		int offset = 0;
+
+		err = lc3_decode(lc3_decoder, in_buf + offset, octets_per_frame, LC3_PCM_FORMAT_S16,
+				 audio_buf, 1);
+
+		if (in_buf != NULL) {
+			offset += octets_per_frame;
+		}
+	}
+
+	if (err == 1) {
+		printk("  decoder performed PLC\n");
+		return;
+
+	} else if (err < 0) {
+		printk("  decoder failed - wrong parameters?\n");
+		return;
+	}
+}
+
+#endif /* defined(CONFIG_LIBLC3) */
+
 static void stream_started_cb(struct bt_bap_stream *stream)
 {
 	struct broadcast_sink_stream *sink_stream =
@@ -88,6 +175,9 @@ static void stream_started_cb(struct bt_bap_stream *stream)
 	sink_stream->valid_cnt = 0U;
 	sink_stream->error_cnt = 0U;
 
+#if defined(CONFIG_LIBLC3)
+	k_work_init_delayable(&sink_stream->lc3_decode_work, lc3_decode_handler);
+#endif /* defined(CONFIG_LIBLC3) */
 	k_sem_give(&sem_bis_synced);
 }
 
@@ -103,8 +193,38 @@ static void stream_stopped_cb(struct bt_bap_stream *stream, uint8_t reason)
 	}
 }
 
-static void stream_recv_cb(struct bt_bap_stream *stream,
-			   const struct bt_iso_recv_info *info,
+#if defined(CONFIG_LIBLC3)
+static void stream_recv_lc3_codec(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info,
+				  struct net_buf *buf)
+{
+	static uint32_t lc3_recv_cnt;
+	struct broadcast_sink_stream *sink_stream =
+		CONTAINER_OF(stream, struct broadcast_sink_stream, stream);
+
+	lc3_recv_cnt++;
+	if ((lc3_recv_cnt % 1000U) == 0U) {
+		printk("Received %u total ISO packets\n", lc3_recv_cnt);
+	}
+
+	if (lc3_decoder == NULL) {
+		printk("LC3 decoder not setup, cannot decode data.\n");
+		return;
+	}
+
+	if ((info->flags & BT_ISO_FLAGS_VALID) == 0) {
+		printk("Bad packet: 0x%02X\n", info->flags);
+		sink_stream->in_buf = NULL;
+		sink_stream->in_buf_len = 0;
+		return;
+	}
+
+	sink_stream->in_buf = buf->data;
+	sink_stream->in_buf_len = buf->len;
+
+	k_work_schedule(&sink_stream->lc3_decode_work, K_NO_WAIT);
+}
+#else
+static void stream_recv_cb(struct bt_bap_stream *stream, const struct bt_iso_recv_info *info,
 			   struct net_buf *buf)
 {
 	struct broadcast_sink_stream *sink_stream =
@@ -129,11 +249,16 @@ static void stream_recv_cb(struct bt_bap_stream *stream,
 		       sink_stream->error_cnt, sink_stream->loss_cnt);
 	}
 }
+#endif /* defined(CONFIG_LIBLC3) */
 
 static struct bt_bap_stream_ops stream_ops = {
 	.started = stream_started_cb,
 	.stopped = stream_stopped_cb,
-	.recv = stream_recv_cb
+#if defined(CONFIG_LIBLC3)
+	.recv = stream_recv_lc3_codec,
+#else
+	.recv = stream_recv_cb,
+#endif /* defined(CONFIG_LIBLC3) */
 };
 
 static void base_recv_cb(struct bt_bap_broadcast_sink *sink, const struct bt_bap_base *base)
@@ -144,13 +269,24 @@ static void base_recv_cb(struct bt_bap_broadcast_sink *sink, const struct bt_bap
 		return;
 	}
 
-	printk("Received BASE with %u subgroups from broadcast sink %p\n",
-	       base->subgroup_count, sink);
+	printk("Received BASE with %u subgroups from broadcast sink %p\n", base->subgroup_count,
+	       sink);
 
 	for (size_t i = 0U; i < base->subgroup_count; i++) {
 		const size_t bis_count = base->subgroups[i].bis_count;
 
 		printk("Subgroup[%zu] has %zu streams\n", i, bis_count);
+
+#if defined(CONFIG_LIBLC3)
+		int8_t ret;
+		struct bt_audio_codec_cfg *codec_cfg = &base->subgroups[i].codec_cfg;
+
+		ret = lc3_enable(codec_cfg);
+		if (ret < 0) {
+			printk("Error: cannot enable LC3 codec.");
+			return;
+		}
+#endif /* defined(CONFIG_LIBLC3) */
 		for (size_t j = 0U; j < bis_count; j++) {
 			const uint8_t index = base->subgroups[i].bis_data[j].index;
 
@@ -198,8 +334,7 @@ static void pa_timer_handler(struct k_work *work)
 			pa_state = BT_BAP_PA_STATE_FAILED;
 		}
 
-		bt_bap_scan_delegator_set_pa_state(req_recv_state->src_id,
-						   pa_state);
+		bt_bap_scan_delegator_set_pa_state(req_recv_state->src_id, pa_state);
 	}
 
 	printk("PA timeout\n");
@@ -216,15 +351,14 @@ static uint16_t interval_to_sync_timeout(uint16_t pa_interval)
 		pa_timeout = BT_GAP_PER_ADV_MAX_TIMEOUT;
 	} else {
 		/* Ensure that the following calculation does not overflow silently */
-		__ASSERT(SYNC_RETRY_COUNT < 10,
-			 "SYNC_RETRY_COUNT shall be less than 10");
+		__ASSERT(SYNC_RETRY_COUNT < 10, "SYNC_RETRY_COUNT shall be less than 10");
 
 		/* Add retries and convert to unit in 10's of ms */
 		pa_timeout = ((uint32_t)pa_interval * SYNC_RETRY_COUNT) / 10;
 
 		/* Enforce restraints */
-		pa_timeout = CLAMP(pa_timeout, BT_GAP_PER_ADV_MIN_TIMEOUT,
-				   BT_GAP_PER_ADV_MAX_TIMEOUT);
+		pa_timeout =
+			CLAMP(pa_timeout, BT_GAP_PER_ADV_MIN_TIMEOUT, BT_GAP_PER_ADV_MAX_TIMEOUT);
 	}
 
 	return pa_timeout;
@@ -232,7 +366,7 @@ static uint16_t interval_to_sync_timeout(uint16_t pa_interval)
 
 static int pa_sync_past(struct bt_conn *conn, uint16_t pa_interval)
 {
-	struct bt_le_per_adv_sync_transfer_param param = { 0 };
+	struct bt_le_per_adv_sync_transfer_param param = {0};
 	int err;
 
 	param.skip = PA_SYNC_SKIP;
@@ -315,8 +449,7 @@ static int bis_sync_req_cb(struct bt_conn *conn,
 {
 	const bool bis_synced = k_sem_count_get(&sem_bis_synced) > 0U;
 
-	printk("BIS sync request received for %p: 0x%08x\n",
-	       recv_state, bis_sync_req[0]);
+	printk("BIS sync request received for %p: 0x%08x\n", recv_state, bis_sync_req[0]);
 
 	/* We only care about a single subgroup in this sample */
 	if (bis_synced && requested_bis_sync != bis_sync_req[0]) {
@@ -433,8 +566,7 @@ static bool scan_check_and_sync_broadcast(struct bt_data *data, void *user_data)
 	if (broadcast_assistant_conn == NULL) {
 		/* Not requested by Broadcast Assistant */
 		k_sem_give(&sem_broadcaster_found);
-	} else if (req_recv_state != NULL &&
-		   bt_addr_le_eq(info->addr, &req_recv_state->addr) &&
+	} else if (req_recv_state != NULL && bt_addr_le_eq(info->addr, &req_recv_state->addr) &&
 		   info->sid == req_recv_state->adv_sid &&
 		   broadcast_id == req_recv_state->broadcast_id) {
 		k_sem_give(&sem_broadcaster_found);
@@ -606,8 +738,7 @@ static int reset(void)
 			err = bt_conn_disconnect(broadcast_assistant_conn,
 						 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
 			if (err) {
-				printk("Disconnecting Broadcast Assistant failed (err %d)\n",
-				       err);
+				printk("Disconnecting Broadcast Assistant failed (err %d)\n", err);
 
 				return err;
 			}
@@ -621,16 +752,14 @@ static int reset(void)
 		} else if (ext_adv != NULL) { /* advertising still running */
 			err = bt_le_ext_adv_stop(ext_adv);
 			if (err) {
-				printk("Stopping advertising set failed (err %d)\n",
-				       err);
+				printk("Stopping advertising set failed (err %d)\n", err);
 
 				return err;
 			}
 
 			err = bt_le_ext_adv_delete(ext_adv);
 			if (err) {
-				printk("Deleting advertising set failed (err %d)\n",
-				       err);
+				printk("Deleting advertising set failed (err %d)\n", err);
 
 				return err;
 			}
@@ -660,8 +789,7 @@ static int start_adv(void)
 {
 	const struct bt_data ad[] = {
 		BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-		BT_DATA_BYTES(BT_DATA_UUID16_ALL,
-			      BT_UUID_16_ENCODE(BT_UUID_BASS_VAL),
+		BT_DATA_BYTES(BT_DATA_UUID16_ALL, BT_UUID_16_ENCODE(BT_UUID_BASS_VAL),
 			      BT_UUID_16_ENCODE(BT_UUID_PACS_VAL)),
 	};
 	int err;
@@ -755,8 +883,7 @@ int main(void)
 			printk("Starting advertising\n");
 			err = start_adv();
 			if (err != 0) {
-				printk("Unable to start advertising connectable: %d\n",
-				       err);
+				printk("Unable to start advertising connectable: %d\n", err);
 
 				return 0;
 			}
@@ -768,8 +895,7 @@ int main(void)
 
 				err = stop_adv();
 				if (err != 0) {
-					printk("Unable to stop advertising: %d\n",
-					       err);
+					printk("Unable to stop advertising: %d\n", err);
 
 					return 0;
 				}
@@ -777,8 +903,7 @@ int main(void)
 				/* Wait for the PA request to determine if we
 				 * should start scanning, or wait for PAST
 				 */
-				err = k_sem_take(&sem_pa_request,
-						 BROADCAST_ASSISTANT_TIMEOUT);
+				err = k_sem_take(&sem_pa_request, BROADCAST_ASSISTANT_TIMEOUT);
 				if (err != 0) {
 					printk("sem_pa_request timed out, resetting\n");
 					continue;
@@ -791,16 +916,15 @@ int main(void)
 		}
 
 		if (strlen(CONFIG_TARGET_BROADCAST_NAME) > 0U) {
-			printk("Scanning for broadcast sources containing`"
-			CONFIG_TARGET_BROADCAST_NAME "`\n");
+			printk("Scanning for broadcast sources "
+			       "containing`" CONFIG_TARGET_BROADCAST_NAME "`\n");
 		} else {
 			printk("Scanning for broadcast sources\n");
 		}
 
 		err = bt_le_scan_start(BT_LE_SCAN_ACTIVE, NULL);
 		if (err != 0 && err != -EALREADY) {
-			printk("Unable to start scan for broadcast sources: %d\n",
-			       err);
+			printk("Unable to start scan for broadcast sources: %d\n", err);
 			return 0;
 		}
 

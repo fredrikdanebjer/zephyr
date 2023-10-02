@@ -9,11 +9,24 @@
 #include <zephyr/bluetooth/audio/bap.h>
 #include <zephyr/bluetooth/audio/bap_lc3_preset.h>
 
+/* Zephyr Controller requires Extended Advertising interval to be a multiple
+ * of the ISO Interval minus 10 ms (max. advertising random delay). This is
+ * required to place the AUX_ADV_IND PDUs in a non-overlapping interval with the
+ * Broadcast ISO radio events.
+ *
+ * I.e. for a 7.5 ms ISO interval use 90 ms minus 10 ms ==> 80 ms advertising
+ * interval.
+ * And, for 10 ms ISO interval, can use 90 ms minus 10 ms ==> 80 ms advertising
+ * interval.
+ */
+#define BT_LE_EXT_ADV_CUSTOM                                                                       \
+	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_EXT_ADV | BT_LE_ADV_OPT_USE_NAME, 0x0080, 0x0080, NULL)
+
 /* When BROADCAST_ENQUEUE_COUNT > 1 we can enqueue enough buffers to ensure that
  * the controller is never idle
  */
 #define BROADCAST_ENQUEUE_COUNT 2U
-#define TOTAL_BUF_NEEDED	(BROADCAST_ENQUEUE_COUNT * CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT)
+#define TOTAL_BUF_NEEDED        (BROADCAST_ENQUEUE_COUNT * CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT)
 
 BUILD_ASSERT(CONFIG_BT_ISO_TX_BUF_COUNT >= TOTAL_BUF_NEEDED,
 	     "CONFIG_BT_ISO_TX_BUF_COUNT should be at least "
@@ -28,18 +41,79 @@ static struct broadcast_source_stream {
 } streams[CONFIG_BT_BAP_BROADCAST_SRC_STREAM_COUNT];
 static struct bt_bap_broadcast_source *broadcast_source;
 
-NET_BUF_POOL_FIXED_DEFINE(tx_pool,
-			  TOTAL_BUF_NEEDED,
-			  BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
+NET_BUF_POOL_FIXED_DEFINE(tx_pool, TOTAL_BUF_NEEDED, BT_ISO_SDU_BUF_SIZE(CONFIG_BT_ISO_TX_MTU),
 			  CONFIG_BT_CONN_TX_USER_DATA_SIZE, NULL);
-static uint8_t mock_data[CONFIG_BT_ISO_TX_MTU];
+#define MAX_SAMPLE_RATE       16000
+#define MAX_FRAME_DURATION_US 10000
+#define MAX_NUM_SAMPLES       ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+static int16_t mock_data[MAX_NUM_SAMPLES];
 static uint16_t seq_num;
 static bool stopping;
 
 static K_SEM_DEFINE(sem_started, 0U, ARRAY_SIZE(streams));
 static K_SEM_DEFINE(sem_stopped, 0U, ARRAY_SIZE(streams));
 
-#define BROADCAST_SOURCE_LIFETIME  120U /* seconds */
+#define BROADCAST_SOURCE_LIFETIME 120U /* seconds */
+
+#if defined(CONFIG_LIBLC3)
+
+#include "lc3.h"
+
+static lc3_encoder_t lc3_encoder;
+static lc3_encoder_mem_16k_t lc3_encoder_mem;
+static int freq_hz;
+static int frame_duration_us;
+static int frames_per_sdu;
+static int octets_per_frame;
+
+static void init_lc3(void)
+{
+	const struct bt_audio_codec_cfg *codec_cfg = &preset_16_2_1.codec_cfg;
+	int ret;
+
+	ret = bt_audio_codec_cfg_get_freq(codec_cfg);
+	if (ret > 0) {
+		freq_hz = bt_audio_codec_cfg_freq_to_freq_hz(ret);
+	} else {
+		return;
+	}
+
+	ret = bt_audio_codec_cfg_get_frame_dur(codec_cfg);
+	if (ret > 0) {
+		frame_duration_us = bt_audio_codec_cfg_frame_dur_to_frame_dur_us(ret);
+	} else {
+		printk("Error: Frame duration not set, cannot start codec.");
+		return;
+	}
+
+	octets_per_frame = bt_audio_codec_cfg_get_octets_per_frame(codec_cfg);
+	frames_per_sdu = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
+	octets_per_frame = bt_audio_codec_cfg_get_octets_per_frame(codec_cfg);
+
+	if (freq_hz < 0) {
+		printk("Error: Codec frequency not set, cannot start codec.");
+		return;
+	}
+
+	if (frame_duration_us < 0) {
+		printk("Error: Frame duration not set, cannot start codec.");
+		return;
+	}
+
+	if (octets_per_frame < 0) {
+		printk("Error: Octets per frame not set, cannot start codec.");
+		return;
+	}
+
+	/* Create the encoder instance. This shall complete before stream_started() is called. */
+	lc3_encoder = lc3_setup_encoder(frame_duration_us, freq_hz, 0, /* No resampling */
+					&lc3_encoder_mem);
+
+	if (lc3_encoder == NULL) {
+		printk("ERROR: Failed to setup LC3 encoder - wrong parameters?\n");
+	}
+}
+#endif /* defined(CONFIG_LIBLC3) */
 
 static void stream_started_cb(struct bt_bap_stream *stream)
 {
@@ -69,13 +143,33 @@ static void stream_sent_cb(struct bt_bap_stream *stream)
 
 	buf = net_buf_alloc(&tx_pool, K_FOREVER);
 	if (buf == NULL) {
-		printk("Could not allocate buffer when sending on %p\n",
-		       stream);
+		printk("Could not allocate buffer when sending on %p\n", stream);
 		return;
 	}
 
 	net_buf_reserve(buf, BT_ISO_CHAN_SEND_RESERVE);
+#if defined(CONFIG_LIBLC3)
+	int lc3_ret;
+	uint8_t lc3_encoder_buffer[preset_16_2_1.qos.sdu];
+
+	if (lc3_encoder == NULL) {
+		printk("LC3 encoder not setup, cannot encode data.\n");
+		return;
+	}
+
+	lc3_ret = lc3_encode(lc3_encoder, LC3_PCM_FORMAT_S16, mock_data, 1, octets_per_frame,
+			     lc3_encoder_buffer);
+
+	if (lc3_ret == -1) {
+		printk("LC3 encoder failed - wrong parameters?: %d", lc3_ret);
+		return;
+	}
+
+	net_buf_add_mem(buf, lc3_encoder_buffer, preset_16_2_1.qos.sdu);
+#else
 	net_buf_add_mem(buf, mock_data, preset_16_2_1.qos.sdu);
+#endif /* defined(CONFIG_LIBLC3) */
+
 	ret = bt_bap_stream_send(stream, buf, source_stream->seq_num++, BT_ISO_TIMESTAMP_NONE);
 	if (ret < 0) {
 		/* This will end broadcasting on this stream. */
@@ -91,10 +185,7 @@ static void stream_sent_cb(struct bt_bap_stream *stream)
 }
 
 static struct bt_bap_stream_ops stream_ops = {
-	.started = stream_started_cb,
-	.stopped = stream_stopped_cb,
-	.sent = stream_sent_cb
-};
+	.started = stream_started_cb, .stopped = stream_stopped_cb, .sent = stream_sent_cb};
 
 static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 {
@@ -128,8 +219,7 @@ static int setup_broadcast_source(struct bt_bap_broadcast_source **source)
 	create_param.packing = BT_ISO_PACKING_SEQUENTIAL;
 
 	printk("Creating broadcast source with %zu subgroups with %zu streams\n",
-	       ARRAY_SIZE(subgroup_param),
-	       ARRAY_SIZE(subgroup_param) * streams_per_subgroup);
+	       ARRAY_SIZE(subgroup_param), ARRAY_SIZE(subgroup_param) * streams_per_subgroup);
 
 	err = bt_bap_broadcast_source_create(&create_param, source);
 	if (err != 0) {
@@ -157,20 +247,22 @@ int main(void)
 		mock_data[i] = i;
 	}
 
+#if defined(CONFIG_LIBLC3)
+	init_lc3();
+#endif /* defined(CONFIG_LIBLC3) */
+
 	while (true) {
 		/* Broadcast Audio Streaming Endpoint advertising data */
-		NET_BUF_SIMPLE_DEFINE(ad_buf,
-				      BT_UUID_SIZE_16 + BT_AUDIO_BROADCAST_ID_SIZE);
+		NET_BUF_SIMPLE_DEFINE(ad_buf, BT_UUID_SIZE_16 + BT_AUDIO_BROADCAST_ID_SIZE);
 		NET_BUF_SIMPLE_DEFINE(base_buf, 128);
 		struct bt_data ext_ad;
 		struct bt_data per_ad;
 		uint32_t broadcast_id;
 
 		/* Create a non-connectable non-scannable advertising set */
-		err = bt_le_ext_adv_create(BT_LE_EXT_ADV_NCONN_NAME, NULL, &adv);
+		err = bt_le_ext_adv_create(BT_LE_EXT_ADV_CUSTOM, NULL, &adv);
 		if (err != 0) {
-			printk("Unable to create extended advertising set: %d\n",
-			       err);
+			printk("Unable to create extended advertising set: %d\n", err);
 			return 0;
 		}
 
@@ -178,7 +270,8 @@ int main(void)
 		err = bt_le_per_adv_set_param(adv, BT_LE_PER_ADV_DEFAULT);
 		if (err) {
 			printk("Failed to set periodic advertising parameters"
-			" (err %d)\n", err);
+			       " (err %d)\n",
+			       err);
 			return 0;
 		}
 
@@ -203,8 +296,7 @@ int main(void)
 		ext_ad.data = ad_buf.data;
 		err = bt_le_ext_adv_set_data(adv, &ext_ad, 1, NULL, 0);
 		if (err != 0) {
-			printk("Failed to set extended advertising data: %d\n",
-			       err);
+			printk("Failed to set extended advertising data: %d\n", err);
 			return 0;
 		}
 
@@ -220,24 +312,21 @@ int main(void)
 		per_ad.data = base_buf.data;
 		err = bt_le_per_adv_set_data(adv, &per_ad, 1);
 		if (err != 0) {
-			printk("Failed to set periodic advertising data: %d\n",
-			       err);
+			printk("Failed to set periodic advertising data: %d\n", err);
 			return 0;
 		}
 
 		/* Start extended advertising */
 		err = bt_le_ext_adv_start(adv, BT_LE_EXT_ADV_START_DEFAULT);
 		if (err) {
-			printk("Failed to start extended advertising: %d\n",
-			       err);
+			printk("Failed to start extended advertising: %d\n", err);
 			return 0;
 		}
 
 		/* Enable Periodic Advertising */
 		err = bt_le_per_adv_start(adv);
 		if (err) {
-			printk("Failed to enable periodic advertising: %d\n",
-			       err);
+			printk("Failed to enable periodic advertising: %d\n", err);
 			return 0;
 		}
 
@@ -262,8 +351,7 @@ int main(void)
 			}
 		}
 
-		printk("Waiting %u seconds before stopped\n",
-		       BROADCAST_SOURCE_LIFETIME);
+		printk("Waiting %u seconds before stopped\n", BROADCAST_SOURCE_LIFETIME);
 		k_sleep(K_SECONDS(BROADCAST_SOURCE_LIFETIME));
 
 		printk("Stopping broadcast source\n");
@@ -292,22 +380,19 @@ int main(void)
 
 		err = bt_le_per_adv_stop(adv);
 		if (err) {
-			printk("Failed to stop periodic advertising (err %d)\n",
-			       err);
+			printk("Failed to stop periodic advertising (err %d)\n", err);
 			return 0;
 		}
 
 		err = bt_le_ext_adv_stop(adv);
 		if (err) {
-			printk("Failed to stop extended advertising (err %d)\n",
-			       err);
+			printk("Failed to stop extended advertising (err %d)\n", err);
 			return 0;
 		}
 
 		err = bt_le_ext_adv_delete(adv);
 		if (err) {
-			printk("Failed to delete extended advertising (err %d)\n",
-			       err);
+			printk("Failed to delete extended advertising (err %d)\n", err);
 			return 0;
 		}
 	}
