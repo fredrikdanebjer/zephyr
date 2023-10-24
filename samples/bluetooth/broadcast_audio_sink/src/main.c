@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2022-2023 Nordic Semiconductor ASA
+ * Copyright (c) 2023 Demant A/S
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -12,6 +13,9 @@
 #include <zephyr/bluetooth/audio/bap.h>
 #include <zephyr/bluetooth/audio/pacs.h>
 #include <zephyr/sys/byteorder.h>
+#include <zephyr/usb/usb_device.h>
+#include <zephyr/usb/class/usb_audio.h>
+
 
 BUILD_ASSERT(IS_ENABLED(CONFIG_SCAN_SELF) || IS_ENABLED(CONFIG_SCAN_OFFLOAD),
 	     "Either SCAN_SELF or SCAN_OFFLOAD must be enabled");
@@ -82,11 +86,23 @@ static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 
 #include "lc3.h"
 
-#define MAX_SAMPLE_RATE       16000
+#define MAX_SAMPLE_RATE       48000
 #define MAX_FRAME_DURATION_US 10000
-#define MAX_NUM_SAMPLES       ((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+#define MAX_NUM_SAMPLES_MONO	((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
+#define MAX_NUM_SAMPLES_STEREO	(2 * MAX_NUM_SAMPLES_MONO)
+#define MAX_PCM_BUF_SIZE_MONO	(MAX_NUM_SAMPLES_MONO * sizeof(int16_t))
+#define MAX_PCM_BUF_SIZE_STEREO	(2 * MAX_PCM_BUF_SIZE_MONO)
 
-static int16_t audio_buf[MAX_NUM_SAMPLES];
+
+#define TX_BUF_NUM		4
+#define TX_BUF_SIZE		MAX_PCM_BUF_SIZE_STEREO
+
+/* PCM */
+static K_FIFO_DEFINE(tx_buf_fifo);
+NET_BUF_POOL_DEFINE(tx_buf_pool, TX_BUF_NUM, TX_BUF_SIZE, 0, net_buf_destroy);
+
+static const struct device *hs_dev = DEVICE_DT_GET(DT_NODELABEL(hs_0));
+static int16_t audio_buf[MAX_NUM_SAMPLES_MONO];
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static int frames_per_sdu;
@@ -117,8 +133,7 @@ static int lc3_enable(struct bt_audio_codec_cfg *codec_cfg)
 
 	frames_per_sdu = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
 
-	lc3_decoder = lc3_setup_decoder(frame_duration_us, freq_hz, 0, /* No resampling */
-					&lc3_decoder_mem);
+	lc3_decoder = lc3_setup_decoder(frame_duration_us, freq_hz, 0 /*MAX_SAMPLE_RATE*/, &lc3_decoder_mem);
 
 	if (lc3_decoder == NULL) {
 		printk("ERROR: Failed to setup LC3 decoder - wrong parameters?\n");
@@ -130,6 +145,9 @@ static int lc3_enable(struct bt_audio_codec_cfg *codec_cfg)
 static void lc3_decode_handler(struct k_work *work)
 {
 	int err = 0;
+	struct net_buf *out_buf;
+	void *pcm_frame;
+	size_t sample_size;
 
 	struct broadcast_sink_stream *sink_stream = CONTAINER_OF(
 		k_work_delayable_from_work(work), struct broadcast_sink_stream, lc3_decode_work);
@@ -159,7 +177,67 @@ static void lc3_decode_handler(struct k_work *work)
 		printk("  decoder failed - wrong parameters?\n");
 		return;
 	}
+
+	__ASSERT(buf->len > 0 && (buf->len % usb_audio_get_in_frame_size(hs_dev)) == 0,
+		 "Invalid length");
+
+	out_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
+	if (out_buf == NULL) {
+		printk("Out of buffers\n");
+		return;
+	}
+
+
+	pcm_frame = net_buf_add(out_buf, MAX_PCM_BUF_SIZE_STEREO);
+	memset(pcm_frame, 0, MAX_PCM_BUF_SIZE_STEREO);
+
+	sample_size = MAX_PCM_BUF_SIZE_STEREO > octets_per_frame ? octets_per_frame : MAX_PCM_BUF_SIZE_STEREO;
+
+	for (size_t i = 0; i < sample_size; i += 2) {
+		((uint16_t*)pcm_frame)[i] = audio_buf[i];
+		((uint16_t*)pcm_frame)[i + 1] = audio_buf[i];
+	}
+
+	net_buf_put(&tx_buf_fifo, out_buf);
+
 }
+
+static void data_request(const struct device *dev)
+{
+	static struct net_buf *pcm_buf;
+	size_t in_frame_size;
+	int err;
+
+	in_frame_size =	usb_audio_get_in_frame_size(dev);
+
+	pcm_buf = net_buf_get(&tx_buf_fifo, K_NO_WAIT);
+	if (pcm_buf == NULL) {
+		void *silence;
+
+		pcm_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
+		if (pcm_buf == NULL) {
+			printk("Out of buffers\n");
+			return;
+		} else {
+			net_buf_reset(pcm_buf);
+		}
+
+		silence = net_buf_add(pcm_buf, 2 * in_frame_size);
+		memset(silence, 0, 2 * in_frame_size);
+	}
+
+	err = usb_audio_send(dev, pcm_buf, in_frame_size);
+	if (err) {
+		printk("USB send failed  %d}n", err);
+	}
+
+	net_buf_unref(pcm_buf);
+	net_buf_pull_mem(pcm_buf, in_frame_size);
+}
+
+static const struct usb_audio_ops ops = {
+	.data_request_cb = data_request,
+};
 
 #endif /* defined(CONFIG_LIBLC3) */
 
@@ -694,6 +772,23 @@ static int init(void)
 
 	for (size_t i = 0U; i < ARRAY_SIZE(streams); i++) {
 		streams[i].stream.ops = &stream_ops;
+	}
+
+	if (IS_ENABLED(CONFIG_USB_DEVICE_AUDIO)) {
+		int ret;
+
+		if (!device_is_ready(hs_dev)) {
+			printk("Can not get USB Headset Device");
+			return -EIO;
+		}
+
+		usb_audio_register(hs_dev, NULL);//	&ops);
+		ret = usb_enable(NULL);
+		if (ret != 0) {
+			printk("Failed to enable USB");
+			return 0;
+		}
+		printk("USB enabled");
 	}
 
 	return 0;
