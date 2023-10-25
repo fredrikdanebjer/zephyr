@@ -91,7 +91,7 @@ static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 #define MAX_NUM_SAMPLES_MONO	((MAX_FRAME_DURATION_US * MAX_SAMPLE_RATE) / USEC_PER_SEC)
 #define MAX_NUM_SAMPLES_STEREO	(2 * MAX_NUM_SAMPLES_MONO)
 #define MAX_PCM_BUF_SIZE_MONO	(MAX_NUM_SAMPLES_MONO * sizeof(int16_t))
-#define MAX_PCM_BUF_SIZE_STEREO	(2 * MAX_PCM_BUF_SIZE_MONO)
+#define MAX_PCM_BUF_SIZE_STEREO	(2 * MAX_PCM_BUF_SIZE_MONO) * 10
 
 
 #define TX_BUF_NUM		4
@@ -149,6 +149,12 @@ static void lc3_decode_handler(struct k_work *work)
 	void *pcm_frame;
 	size_t sample_size;
 
+	static uint64_t i = 0;
+
+	if ((i++ % 1000U) == 0U) {
+		printk("%s:  Received %llu total ISO packets\n", __func__, i);
+	}
+
 	struct broadcast_sink_stream *sink_stream = CONTAINER_OF(
 		k_work_delayable_from_work(work), struct broadcast_sink_stream, lc3_decode_work);
 	const uint8_t *in_buf = sink_stream->in_buf;
@@ -183,7 +189,7 @@ static void lc3_decode_handler(struct k_work *work)
 
 	out_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
 	if (out_buf == NULL) {
-		printk("Out of buffers\n");
+		printk("%s: Out of buffers\n", __func__);
 		return;
 	}
 
@@ -207,7 +213,11 @@ static void data_request(const struct device *dev)
 	static struct net_buf *pcm_buf;
 	size_t in_frame_size;
 	int err;
+/*
+	static uint64_t i = 0;
 
+	printk("%s: lets send to USB %llu\n", __func__, i++);
+*/
 	in_frame_size =	usb_audio_get_in_frame_size(dev);
 
 	pcm_buf = net_buf_get(&tx_buf_fifo, K_NO_WAIT);
@@ -216,7 +226,7 @@ static void data_request(const struct device *dev)
 
 		pcm_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
 		if (pcm_buf == NULL) {
-			printk("Out of buffers\n");
+			printk("%s: Out of buffers\n", __func__);
 			return;
 		} else {
 			net_buf_reset(pcm_buf);
@@ -228,15 +238,25 @@ static void data_request(const struct device *dev)
 
 	err = usb_audio_send(dev, pcm_buf, in_frame_size);
 	if (err) {
-		printk("USB send failed  %d}n", err);
+		printk("USB send failed  %d\n", err);
 	}
 
 	net_buf_unref(pcm_buf);
 	net_buf_pull_mem(pcm_buf, in_frame_size);
 }
 
+static void data_received(const struct device *dev, struct net_buf *buf, size_t size)
+{
+	if (!buf || !size) {
+		return;
+	}
+
+	net_buf_unref(buf);
+}
+
 static const struct usb_audio_ops ops = {
 	.data_request_cb = data_request,
+	.data_received_cb = data_received,
 };
 
 #endif /* defined(CONFIG_LIBLC3) */
@@ -778,17 +798,17 @@ static int init(void)
 		int ret;
 
 		if (!device_is_ready(hs_dev)) {
-			printk("Can not get USB Headset Device");
+			printk("Can not get USB Headset Device\n");
 			return -EIO;
 		}
 
-		usb_audio_register(hs_dev, NULL);//	&ops);
+		usb_audio_register(hs_dev, &ops);
 		ret = usb_enable(NULL);
 		if (ret != 0) {
-			printk("Failed to enable USB");
-			return 0;
+			printk("Failed to enable USB\n");
+			return -1;
 		}
-		printk("USB enabled");
+		printk("USB enabled\n");
 	}
 
 	return 0;
