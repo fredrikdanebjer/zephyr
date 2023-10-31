@@ -250,7 +250,6 @@ static void data_request(const struct device *dev)
 	int16_t usb_audio_data[96] = {0};
 	int size = ring_buf_get(&audio_ring_buf, (uint8_t *)usb_audio_data, 192);
 	if (size != 192) {
-		printk("Failure to get from ring buffer\n");
 		memset(&((uint8_t*)usb_audio_data)[size], 0, 100);
 	}
 
