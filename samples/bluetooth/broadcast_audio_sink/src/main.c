@@ -168,18 +168,12 @@ static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, in
 	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
 	const float step = 2 * 3.1415f / sine_period_samples;
 
-	printk("num_samples = %u\n", num_samples);
-	printk("sine_period_samples = %d\n", sine_period_samples);
-	printk("step = %f\n", step);
-
 	for (unsigned int i = 0; i < num_samples; i++) {
 		const float sample = sin(i * step);
 
 		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
 	}
 }
-
-static bool bc_recvd = false;
 
 static void lc3_decode_handler(struct k_work *work)
 {
@@ -189,8 +183,6 @@ static void lc3_decode_handler(struct k_work *work)
 	size_t sample_size;
 
 	static uint64_t j = 0;
-
-	bc_recvd = true;
 
 	if ((++j % 1000U) == 0U) {
 		printk("%s:  Received %llu total ISO packets\n", __func__, j);
@@ -204,11 +196,6 @@ static void lc3_decode_handler(struct k_work *work)
 	 * it might be required to offload the processing to another task to avoid blocking the
 	 * BT stack.
 	 */
-
-	//printk("%s: Octets per frame: %u\n", __func__, octets_per_frame);
-
-	fill_audio_buf_sin(audio_buf, 1000, 400, 48000);
-
 
 	for (size_t i = 0; i < frames_per_sdu; i++) {
 
@@ -235,48 +222,19 @@ static void lc3_decode_handler(struct k_work *work)
 		return;
 	}
 
-	if (print_net_bufs) {
-		//printk("%s, net_buf_alloc\n", __func__);
-	}
-	//out_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
-	if (out_buf == NULL) {
-		if ((j % 100U) == 0U) {
-			//printk("%s: Out of buffers\n", __func__);
-		}
-		return;
-	} else {
-		//printk("%s: Allocated buffer\n", __func__);
-	}
-
-
-
-	//pcm_frame = net_buf_add(out_buf, octets_per_frame * 4);
-	//memset(pcm_frame, 0, octets_per_frame * 4);
-
-	/* Fill audio buffer with Sine wave only once and repeat encoding the same tone frame */
-	//fill_audio_buf_sin(audio_buf, 1000, 400, 48000);
-	//printk("%s: len %u:", __func__, octets_per_frame);
-	/*for (size_t i = 0U; i < 48; i++) {
-	//	printk("%02x", audio_buf[i]);
-	//	((int16_t*)pcm_frame)[i*2] = ((int16_t*)audio_buf)[i];
-	//	((int16_t*)pcm_frame)[i*2 + 1] = ((int16_t*)audio_buf)[i];
-	
+	// Just fill and send sine wave for now
+	fill_audio_buf_sin(audio_buf, 1000, 1600, 48000);
+	for (size_t i = 0U; i < 48; i++) {
 		audio_stereo_buf[i*2] = audio_buf[i];
 		audio_stereo_buf[i*2+1] = audio_buf[i];
 	}
-	//printk("\n");
 
-	if ((j % 100U) == 0U) {
-		printk("%s: Putting in buffer\n", __func__);
+	for (size_t i = 0U; i < 10; i++) {
+		uint32_t rbret = ring_buf_put(&audio_ring_buf, (uint8_t *)audio_stereo_buf, 192);
+		if (rbret != 192) {
+			printk("Failure to add to ring buffer in loop %zu\n", i);
+		}
 	}
-
-	uint32_t rbret = ring_buf_put(&audio_ring_buf, (uint8_t *)audio_buf, 96);
-	if (rbret != 96) {
-		printk("Failure to add to ring buffer\n");
-	}
-
-	//net_buf_put(&tx_buf_fifo, out_buf);
-	*/
 }
 
 static void data_request(const struct device *dev)
@@ -285,15 +243,12 @@ static void data_request(const struct device *dev)
 	size_t in_frame_size;
 	int err;
 
-	static uint64_t j = 0;
 	static uint64_t k = 0;
-
-	j++;
 
 	in_frame_size =	usb_audio_get_in_frame_size(dev);
 
 	int16_t usb_audio_data[96] = {0};
-	int size = ring_buf_peek(&audio_ring_buf, (uint8_t *)usb_audio_data, 192);
+	int size = ring_buf_get(&audio_ring_buf, (uint8_t *)usb_audio_data, 192);
 	if (size != 192) {
 		printk("Failure to get from ring buffer\n");
 		memset(&((uint8_t*)usb_audio_data)[size], 0, 100);
@@ -1078,7 +1033,7 @@ int main(void)
 		}
 	}
 #endif
-
+/*
 	fill_audio_buf_sin(audio_buf, 1000, 1600, 48000);
 	for (size_t i = 0U; i < 48; i++) {
 		audio_stereo_buf[i*2] = audio_buf[i];
@@ -1091,10 +1046,10 @@ int main(void)
 	} else {
 		printk("Added to ring buffer\n");
 	}
-
 	while(1) {
 		k_msleep(10);
 	}
+*/
 
 	for (size_t i = 0U; i < ARRAY_SIZE(streams_p); i++) {
 		streams_p[i] = &streams[i].stream;
