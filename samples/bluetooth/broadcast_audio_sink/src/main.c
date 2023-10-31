@@ -290,26 +290,14 @@ static void data_request(const struct device *dev)
 
 	j++;
 
-	/*if ((j % 2) == 0) {
-		if (j == 10000) {
-			j = 0;
-		}
-		return;
-	}*/
-
 	in_frame_size =	usb_audio_get_in_frame_size(dev);
 
-/*
-	int size = ring_buf_peek(&audio_ring_buf, (uint8_t *)usb_audio_data, 96);
-
-	if (size != 4) {
+	int16_t usb_audio_data[96] = {0};
+	int size = ring_buf_peek(&audio_ring_buf, (uint8_t *)usb_audio_data, 192);
+	if (size != 192) {
 		printk("Failure to get from ring buffer\n");
 		memset(&((uint8_t*)usb_audio_data)[size], 0, 100);
-	} else {
-//		printk("Fetched from ringbuffer\n");
 	}
-
-*/
 
 	pcm_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
 	if (pcm_buf == NULL) {
@@ -321,7 +309,7 @@ static void data_request(const struct device *dev)
 
 	void *sine = net_buf_add(pcm_buf, 192);
 	memset(sine, 0, 192);
-	memcpy(sine, audio_stereo_buf, 192);
+	memcpy(sine, usb_audio_data, 192);
 
 	err = usb_audio_send(dev, pcm_buf, 192);
 	if (err) {
@@ -343,7 +331,6 @@ static void data_request(const struct device *dev)
 
 static void data_written(const struct device *dev, struct net_buf *buf, size_t size)
 {
-	//printk("%s: Enter\n", __func__);
 	if (print_net_bufs) {
 		printk("%s, net_buf_unref\n", __func__);
 	}
@@ -1095,7 +1082,7 @@ int main(void)
 	fill_audio_buf_sin(audio_buf, 1000, 1600, 48000);
 	for (size_t i = 0U; i < 48; i++) {
 		audio_stereo_buf[i*2] = audio_buf[i];
-		audio_stereo_buf[i*2+1] = i % 10 == 0 ? 16000 : 0;//audio_buf[i];
+		audio_stereo_buf[i*2+1] = audio_buf[i];
 	}
 
 	uint32_t rbret = ring_buf_put(&audio_ring_buf, (uint8_t *)audio_stereo_buf, 192);
