@@ -15,7 +15,9 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/usb/usb_device.h>
 #include <zephyr/usb/class/usb_audio.h>
-
+#if defined(CONFIG_SOC_NRF5340_CPUAPP)
+#include "nrfx_clock.h"
+#endif
 
 BUILD_ASSERT(IS_ENABLED(CONFIG_SCAN_SELF) || IS_ENABLED(CONFIG_SCAN_OFFLOAD),
 	     "Either SCAN_SELF or SCAN_OFFLOAD must be enabled");
@@ -82,6 +84,8 @@ static uint32_t requested_bis_sync;
 static uint32_t bis_index_bitfield;
 static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 
+static bool print_net_bufs = 0;
+
 #if defined(CONFIG_LIBLC3)
 
 #include "lc3.h"
@@ -94,7 +98,7 @@ static uint8_t sink_broadcast_code[BT_AUDIO_BROADCAST_CODE_SIZE];
 #define MAX_PCM_BUF_SIZE_STEREO	(2 * MAX_PCM_BUF_SIZE_MONO) * 10
 
 
-#define TX_BUF_NUM		4
+#define TX_BUF_NUM		10
 #define TX_BUF_SIZE		MAX_PCM_BUF_SIZE_STEREO
 
 /* PCM */
@@ -102,7 +106,9 @@ static K_FIFO_DEFINE(tx_buf_fifo);
 NET_BUF_POOL_DEFINE(tx_buf_pool, TX_BUF_NUM, TX_BUF_SIZE, 0, net_buf_destroy);
 
 static const struct device *hs_dev = DEVICE_DT_GET(DT_NODELABEL(hs_0));
-static int16_t audio_buf[MAX_NUM_SAMPLES_MONO];
+
+static int16_t audio_buf[MAX_NUM_SAMPLES_MONO * 3];
+static int16_t audio_stereo_buf[MAX_NUM_SAMPLES_MONO * 3 * 2];
 static lc3_decoder_t lc3_decoder;
 static lc3_decoder_mem_16k_t lc3_decoder_mem;
 static int frames_per_sdu;
@@ -133,7 +139,7 @@ static int lc3_enable(struct bt_audio_codec_cfg *codec_cfg)
 
 	frames_per_sdu = bt_audio_codec_cfg_get_frame_blocks_per_sdu(codec_cfg, true);
 
-	lc3_decoder = lc3_setup_decoder(frame_duration_us, freq_hz, 0 /*MAX_SAMPLE_RATE*/, &lc3_decoder_mem);
+	lc3_decoder = lc3_setup_decoder(frame_duration_us, freq_hz, 0, &lc3_decoder_mem);
 
 	if (lc3_decoder == NULL) {
 		printk("ERROR: Failed to setup LC3 decoder - wrong parameters?\n");
@@ -142,6 +148,39 @@ static int lc3_enable(struct bt_audio_codec_cfg *codec_cfg)
 	return 0;
 }
 
+#include <zephyr/sys/ring_buffer.h>
+
+#define AUDIO_RING_BUF_BYTES  10000
+RING_BUF_DECLARE(audio_ring_buf, AUDIO_RING_BUF_BYTES);
+
+#define AUDIO_VOLUME            (INT16_MAX - 3000) /* codec does clipping above INT16_MAX - 3000 */
+/**
+ * Use the math lib to generate a sine-wave using 16 bit samples into a buffer.
+ *
+ * @param buf Destination buffer
+ * @param length_us Length of the buffer in microseconds
+ * @param frequency_hz frequency in Hz
+ * @param sample_rate_hz sample-rate in Hz.
+ */
+static void fill_audio_buf_sin(int16_t *buf, int length_us, int frequency_hz, int sample_rate_hz)
+{
+	const int sine_period_samples = sample_rate_hz / frequency_hz;
+	const unsigned int num_samples = (length_us * sample_rate_hz) / USEC_PER_SEC;
+	const float step = 2 * 3.1415f / sine_period_samples;
+
+	printk("num_samples = %u\n", num_samples);
+	printk("sine_period_samples = %d\n", sine_period_samples);
+	printk("step = %f\n", step);
+
+	for (unsigned int i = 0; i < num_samples; i++) {
+		const float sample = sin(i * step);
+
+		buf[i] = (int16_t)(AUDIO_VOLUME * sample);
+	}
+}
+
+static bool bc_recvd = false;
+
 static void lc3_decode_handler(struct k_work *work)
 {
 	int err = 0;
@@ -149,10 +188,12 @@ static void lc3_decode_handler(struct k_work *work)
 	void *pcm_frame;
 	size_t sample_size;
 
-	static uint64_t i = 0;
+	static uint64_t j = 0;
 
-	if ((i++ % 1000U) == 0U) {
-		printk("%s:  Received %llu total ISO packets\n", __func__, i);
+	bc_recvd = true;
+
+	if ((++j % 1000U) == 0U) {
+		printk("%s:  Received %llu total ISO packets\n", __func__, j);
 	}
 
 	struct broadcast_sink_stream *sink_stream = CONTAINER_OF(
@@ -163,6 +204,12 @@ static void lc3_decode_handler(struct k_work *work)
 	 * it might be required to offload the processing to another task to avoid blocking the
 	 * BT stack.
 	 */
+
+	//printk("%s: Octets per frame: %u\n", __func__, octets_per_frame);
+
+	fill_audio_buf_sin(audio_buf, 1000, 400, 48000);
+
+
 	for (size_t i = 0; i < frames_per_sdu; i++) {
 
 		int offset = 0;
@@ -176,36 +223,60 @@ static void lc3_decode_handler(struct k_work *work)
 	}
 
 	if (err == 1) {
-		printk("  decoder performed PLC\n");
+		if ((j % 100U) == 0U) {
+			printk("  decoder performed PLC\n");
+		}
 		return;
 
 	} else if (err < 0) {
-		printk("  decoder failed - wrong parameters?\n");
+		if ((j % 100U) == 0U) {
+			printk("  decoder failed - wrong parameters?\n");
+		}
 		return;
 	}
 
-	__ASSERT(buf->len > 0 && (buf->len % usb_audio_get_in_frame_size(hs_dev)) == 0,
-		 "Invalid length");
-
-	out_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
+	if (print_net_bufs) {
+		//printk("%s, net_buf_alloc\n", __func__);
+	}
+	//out_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
 	if (out_buf == NULL) {
-		printk("%s: Out of buffers\n", __func__);
+		if ((j % 100U) == 0U) {
+			//printk("%s: Out of buffers\n", __func__);
+		}
 		return;
+	} else {
+		//printk("%s: Allocated buffer\n", __func__);
 	}
 
 
-	pcm_frame = net_buf_add(out_buf, MAX_PCM_BUF_SIZE_STEREO);
-	memset(pcm_frame, 0, MAX_PCM_BUF_SIZE_STEREO);
 
-	sample_size = MAX_PCM_BUF_SIZE_STEREO > octets_per_frame ? octets_per_frame : MAX_PCM_BUF_SIZE_STEREO;
+	//pcm_frame = net_buf_add(out_buf, octets_per_frame * 4);
+	//memset(pcm_frame, 0, octets_per_frame * 4);
 
-	for (size_t i = 0; i < sample_size; i += 2) {
-		((uint16_t*)pcm_frame)[i] = audio_buf[i];
-		((uint16_t*)pcm_frame)[i + 1] = audio_buf[i];
+	/* Fill audio buffer with Sine wave only once and repeat encoding the same tone frame */
+	//fill_audio_buf_sin(audio_buf, 1000, 400, 48000);
+	//printk("%s: len %u:", __func__, octets_per_frame);
+	/*for (size_t i = 0U; i < 48; i++) {
+	//	printk("%02x", audio_buf[i]);
+	//	((int16_t*)pcm_frame)[i*2] = ((int16_t*)audio_buf)[i];
+	//	((int16_t*)pcm_frame)[i*2 + 1] = ((int16_t*)audio_buf)[i];
+	
+		audio_stereo_buf[i*2] = audio_buf[i];
+		audio_stereo_buf[i*2+1] = audio_buf[i];
+	}
+	//printk("\n");
+
+	if ((j % 100U) == 0U) {
+		printk("%s: Putting in buffer\n", __func__);
 	}
 
-	net_buf_put(&tx_buf_fifo, out_buf);
+	uint32_t rbret = ring_buf_put(&audio_ring_buf, (uint8_t *)audio_buf, 96);
+	if (rbret != 96) {
+		printk("Failure to add to ring buffer\n");
+	}
 
+	//net_buf_put(&tx_buf_fifo, out_buf);
+	*/
 }
 
 static void data_request(const struct device *dev)
@@ -213,42 +284,68 @@ static void data_request(const struct device *dev)
 	static struct net_buf *pcm_buf;
 	size_t in_frame_size;
 	int err;
-/*
-	static uint64_t i = 0;
 
-	printk("%s: lets send to USB %llu\n", __func__, i++);
-*/
+	static uint64_t j = 0;
+	static uint64_t k = 0;
+
+	j++;
+
+	/*if ((j % 2) == 0) {
+		if (j == 10000) {
+			j = 0;
+		}
+		return;
+	}*/
+
 	in_frame_size =	usb_audio_get_in_frame_size(dev);
 
-	pcm_buf = net_buf_get(&tx_buf_fifo, K_NO_WAIT);
+/*
+	int size = ring_buf_peek(&audio_ring_buf, (uint8_t *)usb_audio_data, 96);
+
+	if (size != 4) {
+		printk("Failure to get from ring buffer\n");
+		memset(&((uint8_t*)usb_audio_data)[size], 0, 100);
+	} else {
+//		printk("Fetched from ringbuffer\n");
+	}
+
+*/
+
+	pcm_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
 	if (pcm_buf == NULL) {
-		void *silence;
-
-		pcm_buf = net_buf_alloc(&tx_buf_pool, K_NO_WAIT);
-		if (pcm_buf == NULL) {
-			printk("%s: Out of buffers\n", __func__);
-			return;
-		} else {
-			net_buf_reset(pcm_buf);
-		}
-
-		silence = net_buf_add(pcm_buf, 2 * in_frame_size);
-		memset(silence, 0, 2 * in_frame_size);
+		printk("Couldnt allocate pcm_buf\n");
+		return;
+	} else {
+		net_buf_reset(pcm_buf);
 	}
 
-	err = usb_audio_send(dev, pcm_buf, in_frame_size);
+	void *sine = net_buf_add(pcm_buf, 192);
+	memset(sine, 0, 192);
+	memcpy(sine, audio_stereo_buf, 192);
+
+	err = usb_audio_send(dev, pcm_buf, 192);
 	if (err) {
-		printk("USB send failed  %d\n", err);
+		static uint64_t fail = 0;
+		fail++;
+		if ((k % 500U) == 0U) {
+			printk("USB send failed %llu, due to %d\n", fail, err);
+		}
+		net_buf_unref(pcm_buf);
+	} else {
+		static uint64_t succeed = 0;
+		succeed++;
+		if ((k % 100U) == 0U) {
+			printk("USB send succeeded %llu\n", succeed);
+		}
 	}
-
-	net_buf_unref(pcm_buf);
-	net_buf_pull_mem(pcm_buf, in_frame_size);
+	k++;
 }
 
-static void data_received(const struct device *dev, struct net_buf *buf, size_t size)
+static void data_written(const struct device *dev, struct net_buf *buf, size_t size)
 {
-	if (!buf || !size) {
-		return;
+	//printk("%s: Enter\n", __func__);
+	if (print_net_bufs) {
+		printk("%s, net_buf_unref\n", __func__);
 	}
 
 	net_buf_unref(buf);
@@ -256,7 +353,7 @@ static void data_received(const struct device *dev, struct net_buf *buf, size_t 
 
 static const struct usb_audio_ops ops = {
 	.data_request_cb = data_request,
-	.data_received_cb = data_received,
+	.data_written_cb = data_written,
 };
 
 #endif /* defined(CONFIG_LIBLC3) */
@@ -721,7 +818,7 @@ static bool data_cb(struct bt_data *data, void *user_data)
 static void broadcast_scan_recv(const struct bt_le_scan_recv_info *info, struct net_buf_simple *ad)
 {
 	if (info->interval != 0U) {
-		/* call to bt_data_parse consumes netbufs so shallow clone for verbose output */
+		// call to bt_data_parse consumes netbufs so shallow clone for verbose output
 		if (strlen(CONFIG_TARGET_BROADCAST_NAME) > 0U) {
 			struct net_buf_simple buf_copy;
 			char name[NAME_LEN] = {0};
@@ -980,6 +1077,38 @@ int main(void)
 		return 0;
 	}
 
+
+
+#if defined(CONFIG_SOC_NRF5340_CPUAPP)
+	/* Set nRF5340 cpu app core to 128 MHz */
+	err = nrfx_clock_divider_set(NRF_CLOCK_DOMAIN_HFCLK, NRF_CLOCK_HFCLK_DIV_1);
+
+	if (err != NRFX_ERROR_BASE_NUM) {
+		printk("Error changing clock to 128 MHz\n");
+	} else {
+		nrfx_clock_hfclk_start();
+		while (!nrfx_clock_hfclk_is_running()) {
+		}
+	}
+#endif
+
+	fill_audio_buf_sin(audio_buf, 1000, 1600, 48000);
+	for (size_t i = 0U; i < 48; i++) {
+		audio_stereo_buf[i*2] = audio_buf[i];
+		audio_stereo_buf[i*2+1] = i % 10 == 0 ? 16000 : 0;//audio_buf[i];
+	}
+
+	uint32_t rbret = ring_buf_put(&audio_ring_buf, (uint8_t *)audio_stereo_buf, 192);
+	if (rbret != 192) {
+		printk("Failure to add to ring buffer\n");
+	} else {
+		printk("Added to ring buffer\n");
+	}
+
+	while(1) {
+		k_msleep(10);
+	}
+
 	for (size_t i = 0U; i < ARRAY_SIZE(streams_p); i++) {
 		streams_p[i] = &streams[i].stream;
 	}
@@ -993,7 +1122,6 @@ int main(void)
 
 			return 0;
 		}
-
 		if (IS_ENABLED(CONFIG_SCAN_OFFLOAD)) {
 			printk("Starting advertising\n");
 			err = start_adv();
@@ -1049,7 +1177,7 @@ int main(void)
 			continue;
 		}
 		printk("Broadcast source found, waiting for PA sync\n");
-
+		
 		err = bt_le_scan_stop();
 		if (err != 0) {
 			printk("bt_le_scan_stop failed with %d, resetting\n", err);
@@ -1071,7 +1199,6 @@ wait_for_pa_sync:
 			printk("sem_pa_synced timed out, resetting\n");
 			continue;
 		}
-
 		printk("Broadcast source PA synced, creating Broadcast Sink\n");
 		err = bt_bap_broadcast_sink_create(pa_sync, broadcaster_broadcast_id,
 						   &broadcast_sink);
@@ -1128,7 +1255,14 @@ wait_for_pa_sync:
 		}
 
 		printk("Waiting for PA disconnected\n");
-		k_sem_take(&sem_pa_sync_lost, K_FOREVER);
+		while (1) {//k_sem_take(&sem_pa_sync_lost, K_NO_WAIT)) {
+			k_yield();
+			k_msleep(10);
+		}
+
+		while (1) {//k_sem_take(&sem_pa_sync_lost, K_NO_WAIT)) {
+			k_msleep(10);
+		}
 	}
 	return 0;
 }
